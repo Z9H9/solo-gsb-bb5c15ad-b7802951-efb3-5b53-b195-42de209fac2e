@@ -7,15 +7,21 @@
 
 导入约定：
 
-* 每个 ``components[]`` 组件规范化为一个包节点（``name@version``），组件的
-  ``bom-ref`` 记录到节点的 ``bom_refs`` 字段，并建立 ``bom-ref -> 节点`` 映射；
+* ``metadata.component``（根组件）与 ``components[]`` 中的组件及其任意层嵌套
+  ``components`` 都规范化为包节点（``name@version``）。登记顺序固定：先根组件，
+  再按声明顺序遍历顶层组件，每个组件登记自身后以前序深度优先登记其嵌套组件；
+  组件的 ``bom-ref`` 记录到节点的 ``bom_refs`` 字段，并建立 ``bom-ref -> 节点``
+  映射。**全部组件登记完成后才解析 dependencies**，因此根包仅出现在
+  ``metadata.component``、依赖包只出现在嵌套 ``components`` 的 BOM 也能还原
+  完整依赖图；
 * 组件许可证取 ``licenses`` 中的 SPDX ``id``、``expression`` 或兜底 ``license.name``；
   纯 `` OR `` 表达式与多个并列许可证条目解析为**多许可证候选**，含 AND、括号或
   未知标识的表达式仍按未知处理，缺失许可证按未知（UNLICENSED）处理；
 * ``dependencies[]`` 按 ``ref`` / ``dependsOn`` 还原依赖边（方向：使用方 -> 被依赖方），
   引用不到任何组件 bom-ref 的条目保留为未解析告警，不凭空造节点；
 * 为避免静默合并，以下情况直接判定为解析错误（API 层返回 422）：
-  同一 ``bom-ref`` 重复出现；同名同版本的组件许可证不一致。
+  同一 ``bom-ref`` 重复出现（``metadata.component`` 与所有嵌套组件共享同一
+  bom-ref 命名空间）；同名同版本的组件许可证不一致。
 
 解析成功后完全复用 ``analyzer._build_result`` 的传递约束与最短路径冲突分析，
 审计结果与旧格式 manifest 一样进入历史列表并可按原方式导出。
@@ -74,20 +80,23 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
     warning_seen: Set[str] = set()
     warn = lambda msg: analyzer._add_warning(warnings, warning_seen, msg)
 
-    # 1) 注册组件节点并建立 bom-ref -> 节点 映射
+    # 1) 注册组件节点并建立 bom-ref -> 节点 映射。
+    #    登记顺序固定：先 metadata.component 根组件（含其嵌套 components），
+    #    再按声明顺序遍历顶层 components[]，每个组件登记自身后以前序深度优先
+    #    登记其任意层嵌套 components。全部登记完成后再解析 dependencies，
+    #    保证根包仅在 metadata.component、依赖包位于嵌套 components 的 BOM
+    #    也能解析出真实依赖图，而不是把根引用记为未解析。
     nodes: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
     ref_map: Dict[str, str] = {}
     seen_refs: Set[str] = set()
 
-    for component in raw_components:
-        if not isinstance(component, dict):
-            warn("components 中存在非对象条目，已跳过：%r" % (component,))
-            continue
+    def register_component(component: Dict[str, Any], origin: str) -> Optional[Dict[str, Any]]:
+        """登记单个组件；需要中止导入时返回错误结果，否则返回 None。"""
         name = str(component.get("name") or "").strip()
         if not name:
-            warn("components 中存在缺少 name 的条目，已跳过：%r" % (component,))
-            continue
+            warn("%s 中存在缺少 name 的条目，已跳过：%r" % (origin, component))
+            return None
         version, _ = analyzer.clean_version(component.get("version"))
         nid = analyzer.node_id(name, version)
         info = lic.parse_license_entries(_extract_license(component, warn))
@@ -122,7 +131,7 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
             if bom_ref:
                 existing["bom_refs"].append(bom_ref)
                 ref_map[bom_ref] = nid
-            continue
+            return None
 
         nodes[nid] = analyzer._node_from_info(
             nid, name, version, info, {"bom_refs": [bom_ref] if bom_ref else []}
@@ -130,6 +139,52 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
         order.append(nid)
         if bom_ref:
             ref_map[bom_ref] = nid
+        return None
+
+    def walk_components(root: Dict[str, Any], origin: str) -> Optional[Dict[str, Any]]:
+        """以前序深度优先（声明顺序）登记组件及其任意层嵌套 components。"""
+        stack: List[Dict[str, Any]] = [root]
+        while stack:
+            component = stack.pop()
+            error = register_component(component, origin)
+            if error is not None:
+                return error
+            nested = component.get("components")
+            if nested is None:
+                continue
+            if not isinstance(nested, list):
+                warn(
+                    "组件 %r 的嵌套 components 字段不是数组，已忽略。"
+                    % (component.get("name") or component.get("bom-ref") or "?")
+                )
+                continue
+            # 逆序入栈，弹出顺序即声明顺序（非对象条目在登记其父组件时告警）
+            for child in reversed(nested):
+                if isinstance(child, dict):
+                    stack.append(child)
+                else:
+                    warn("嵌套 components 中存在非对象条目，已跳过：%r" % (child,))
+        return None
+
+    # 1a) metadata.component 根组件（可能自身携带嵌套 components）
+    metadata = bom.get("metadata")
+    if isinstance(metadata, dict):
+        root_component = metadata.get("component")
+        if isinstance(root_component, dict):
+            error = walk_components(root_component, "metadata.component")
+            if error is not None:
+                return error
+        elif root_component is not None:
+            warn("metadata.component 不是对象，已忽略：%r" % (root_component,))
+
+    # 1b) 顶层 components[] 及任意层嵌套 components
+    for component in raw_components:
+        if not isinstance(component, dict):
+            warn("components 中存在非对象条目，已跳过：%r" % (component,))
+            continue
+        error = walk_components(component, "components")
+        if error is not None:
+            return error
 
     # 2) 按 ref / dependsOn 还原依赖边
     edges: List[Dict[str, Any]] = []

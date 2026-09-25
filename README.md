@@ -22,6 +22,7 @@ manifest（或直接上传 **CycloneDX JSON** SBOM），系统会：
    条目自动回到待复核；原始冲突、严重程度与两次审计对比结果完全不受影响；
 8. **CycloneDX SBOM 导入** —— 网页粘贴/上传与 `POST /api/audit`、`/api/audit/upload`
    均自动识别 CycloneDX JSON（`bomFormat` + `components` + `dependencies`）：
+   `metadata.component` 根组件与任意层嵌套 `components` 全部登记为包节点，
    组件的 `bom-ref` 映射为包节点，按 `ref` / `dependsOn` 还原依赖边后复用同一套
    兼容矩阵与最短路径冲突分析；审计结果照常进入历史列表并可导出；
 9. **根包退役预演** —— 根包即**没有入边的包**（没有任何其他包依赖它）。在网页第 3 节
@@ -230,7 +231,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "metadata": { "component": { "type": "application", "name": "shop-backend", "version": "3.2.0" } },
+  "metadata": { "component": { "type": "application", "name": "shop-backend", "version": "3.2.0",
+                               "licenses": [ { "license": { "id": "GPL-2.0" } } ] } },
   "components": [
     {
       "type": "application",
@@ -255,10 +257,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 导入约定：
 
-- **节点**：每个 `components[]` 组件按 `name` + `version` 规范化为包节点（与原生
-  manifest 同一套规则），组件的 `bom-ref` 记录在节点的 `bom_refs` 字段并建立
-  `bom-ref → 节点` 映射；审计名依次取顶层 `name`、`metadata.component.name`、
-  请求参数 `name`；
+- **节点**：`metadata.component`（根组件）与 `components[]` 中的组件及其**任意层
+  嵌套 `components`** 都按 `name` + `version` 规范化为包节点（与原生 manifest
+  同一套规则）。登记顺序固定：先根组件，再按声明顺序遍历顶层组件，每个组件登记
+  自身后以前序深度优先登记其嵌套组件；组件的 `bom-ref` 记录在节点的 `bom_refs`
+  字段并建立 `bom-ref → 节点` 映射，**全部组件登记完成后才解析 `dependencies`**，
+  因此根包仅出现在 `metadata.component`、依赖包只出现在嵌套 `components` 的
+  BOM 也能还原完整依赖图与冲突路径；审计名依次取顶层 `name`、
+  `metadata.component.name`、请求参数 `name`；
 - **依赖边**：`dependencies[]` 按 `ref` / `dependsOn` 还原为「使用方 → 被依赖方」
   的依赖边，随后复用同一套兼容矩阵与最短路径冲突分析；
 - **许可证**：取组件 `licenses` 中的 SPDX `id` 或 `expression`（兜底取
@@ -267,16 +273,84 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   **多许可证候选**（候选集合相同时视为同一许可证，允许合并）；含 `AND`、
   括号或未知标识的表达式保留原文按未知处理；**缺失许可证按未知处理**
   （显示为 `UNLICENSED`，相关边按“需人工确认”告警）；
-- **422（不静默合并）**：同一 `bom-ref` 重复出现，或同名同版本组件对应不同许可证
+- **422（不静默合并）**：同一 `bom-ref` 重复出现（`metadata.component` 与所有
+  嵌套组件共享同一 bom-ref 命名空间），或同名同版本组件对应不同许可证
   （单许可证按规范化标识比较，多候选按去重后的候选集合比较，`MIT` 与
   `MIT License` 视为相同）时，返回明确的 `422` 错误并中止导入，需修正 BOM
   后重新提交；
-- **未解析引用**：`dependencies` 中引用了不存在于 `components` 的 bom-ref 时，
+- **未解析引用**：`dependencies` 中引用了不存在于任何已登记组件（含
+  `metadata.component` 与嵌套组件）的 bom-ref 时，
   对应条目进入 `unresolved` 列表并产生告警，不会凭空造节点；
 - 结果与原生 manifest 完全一致地进入历史列表、参与两次审计对比、按包筛选与导出，
   导出 JSON 中带 `"source_format": "cyclonedx"` 标识。
 
-内置示例：`GET /api/sample/cyclonedx`（网页端「载入 CycloneDX 示例」按钮同源）。
+### 根组件在 metadata、依赖位于嵌套 components 的 BOM
+
+真实工具（如 cdxgen）生成的 BOM 常把**根应用只放在 `metadata.component`**，
+并把传递依赖**嵌套在组件的 `components` 里**，`dependencies[]` 直接用根组件的
+`bom-ref` 作为起点：
+
+```json
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "metadata": {
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:app/shop-backend@3.2.0",
+      "name": "shop-backend",
+      "version": "3.2.0",
+      "licenses": [ { "license": { "id": "GPL-2.0" } } ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:npm/web-ui@1.4.2",
+      "name": "web-ui",
+      "version": "1.4.2",
+      "licenses": [ { "expression": "Apache-2.0" } ],
+      "components": [
+        {
+          "type": "library",
+          "bom-ref": "pkg:npm/chart-render@5.1.0",
+          "name": "chart-render",
+          "version": "5.1.0",
+          "licenses": [ { "license": { "id": "GPL-3.0" } } ]
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    { "ref": "pkg:app/shop-backend@3.2.0", "dependsOn": ["pkg:npm/web-ui@1.4.2"] },
+    { "ref": "pkg:npm/web-ui@1.4.2", "dependsOn": ["pkg:npm/chart-render@5.1.0"] }
+  ]
+}
+```
+
+导入时先按固定顺序登记 `metadata.component` 根组件与任意层嵌套组件、完整建立
+`bom-ref → 节点` 映射，再解析 `dependencies`，因此上例能还原
+`shop-backend → web-ui → chart-render` 的真实依赖链，并给出
+`GPL-2.0 → Apache-2.0`（硬冲突，路径 `shop-backend@3.2.0 → web-ui@1.4.2`）与
+`GPL-2.0 → GPL-3.0`（硬冲突，传递路径经 `web-ui`）等冲突，而不是把根引用记为
+未解析、丢失整张依赖图。同名同版本组件仍按既有规则合并或许可证不一致时报
+`422`，重复 `bom-ref` 同样报 `422`，不会静默覆盖。
+
+服务启动后（`docker compose up --build`，宿主机端口 **8000**）可通过以下地址验证：
+
+| 入口 | 地址 |
+| --- | --- |
+| 网页界面 | <http://localhost:8000/>（粘贴或上传该 BOM，或点「载入 CycloneDX 示例」——内置示例 `static/examples/sample-cyclonedx.json` 即为此类结构） |
+| JSON API | `POST http://localhost:8000/api/audit`（JSON 请求体）或 `POST http://localhost:8000/api/audit/upload`（文件上传） |
+| 交互式 API 文档 | <http://localhost:8000/docs> |
+
+```bash
+# 上传此类 SBOM 文件（宿主机 8000 端口）
+curl -F "file=@static/examples/sample-cyclonedx.json" http://localhost:8000/api/audit/upload
+```
+
+内置示例：`GET /api/sample/cyclonedx`（网页端「载入 CycloneDX 示例」按钮同源；
+示例本身就是「根组件仅在 `metadata.component`、部分依赖位于嵌套 `components`」的 BOM）。
 
 ```bash
 # 直接提交 CycloneDX BOM 审计
@@ -992,7 +1066,7 @@ CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cycloned
 ├── app/
 │   ├── main.py        # FastAPI 路由（JSON API + 网页，含对比/复核/预演/最少断边/复现包接口）
 │   ├── analyzer.py    # manifest 解析、节点规范化、传递约束、最短路径（自动路由 CycloneDX）
-│   ├── cyclonedx.py   # CycloneDX JSON 导入：bom-ref 映射节点、ref/dependsOn 还原依赖边
+│   ├── cyclonedx.py   # CycloneDX JSON 导入：metadata 根组件与任意层嵌套组件登记、bom-ref 映射节点、ref/dependsOn 还原依赖边
 │   ├── compare.py     # 两次审计对比：节点/冲突配对与变化检测（纯只读）
 │   ├── retire.py      # 根包退役预演：从剩余根包重算可达集合（纯只读）
 │   ├── relicense.py   # 单包许可证替换预演：替换一个节点许可证后沿原图重算并配对（纯只读）

@@ -259,6 +259,206 @@ def test_wrong_bom_format_rejected() -> None:
     _check("error mentions bomFormat", "bomFormat" in result["error"], result["error"])
 
 
+def test_metadata_root_and_nested_components() -> None:
+    """根包仅在 metadata.component、依赖包位于嵌套 components 的 BOM。
+
+    修复前：只登记顶层 components，根引用被记为未解析，依赖边与冲突消失。
+    """
+    bom = _bom(
+        [
+            dict(
+                _comp("ref-mid", "mid", "1.0.0", [{"license": {"id": "MIT"}}]),
+                components=[
+                    _comp("ref-leaf", "leaf", "2.0.0", [{"expression": "Apache-2.0"}]),
+                ],
+            ),
+        ],
+        [
+            {"ref": "ref-root", "dependsOn": ["ref-mid"]},
+            {"ref": "ref-mid", "dependsOn": ["ref-leaf"]},
+        ],
+        metadata={
+            "component": {
+                "type": "application",
+                "bom-ref": "ref-root",
+                "name": "app",
+                "version": "1.0.0",
+                "licenses": [{"license": {"id": "GPL-2.0"}}],
+            }
+        },
+    )
+    result = analyzer.analyze_manifest(bom)
+    _check("metadata root + nested parsed", result["status"] == "conflict", result.get("error"))
+    _check(
+        "root and nested components registered",
+        result["summary"]["packages"] == 3,
+        str(result["summary"]),
+    )
+    _check(
+        "stable order: metadata root first, then pre-order",
+        [n["id"] for n in result["nodes"]] == ["app@1.0.0", "mid@1.0.0", "leaf@2.0.0"],
+        str([n["id"] for n in result["nodes"]]),
+    )
+    _check(
+        "root ref resolved, no unresolved left",
+        result["summary"]["unresolved"] == 0,
+        str(result["unresolved"]),
+    )
+    edges = {(e["source"], e["target"]) for e in result["edges"]}
+    _check(
+        "edges from root and nested restored",
+        edges == {("app@1.0.0", "mid@1.0.0"), ("mid@1.0.0", "leaf@2.0.0")},
+        str(edges),
+    )
+    conflict = next(
+        c for c in result["conflicts"] if c["node"] == "leaf@2.0.0" and c["severity"] == "error"
+    )
+    _check(
+        "transitive conflict path via nested component",
+        conflict["ancestor"] == "app@1.0.0"
+        and conflict["path"] == ["app@1.0.0", "mid@1.0.0", "leaf@2.0.0"],
+        str(conflict["path"]),
+    )
+    by_id = {n["id"]: n for n in result["nodes"]}
+    _check(
+        "bom_refs recorded for root and nested",
+        by_id["app@1.0.0"]["bom_refs"] == ["ref-root"]
+        and by_id["leaf@2.0.0"]["bom_refs"] == ["ref-leaf"],
+        str({k: v["bom_refs"] for k, v in by_id.items()}),
+    )
+
+
+def test_deeply_nested_components() -> None:
+    """任意层嵌套（含 metadata.component 自身的嵌套）都按前序登记。"""
+    bom = _bom(
+        [
+            dict(
+                _comp("r-a", "a", "1", [{"license": {"id": "GPL-3.0"}}]),
+                components=[
+                    dict(
+                        _comp("r-b", "b", "1", [{"license": {"id": "MIT"}}]),
+                        components=[_comp("r-c", "c", "1", [{"license": {"id": "Apache-2.0"}}])],
+                    ),
+                ],
+            ),
+        ],
+        [
+            {"ref": "r-root", "dependsOn": ["r-inner"]},
+            {"ref": "r-inner", "dependsOn": ["r-a"]},
+            {"ref": "r-a", "dependsOn": ["r-b"]},
+            {"ref": "r-b", "dependsOn": ["r-c"]},
+        ],
+        metadata={
+            "component": {
+                "type": "application",
+                "bom-ref": "r-root",
+                "name": "root",
+                "version": "1",
+                "licenses": [{"license": {"id": "MIT"}}],
+                "components": [
+                    _comp("r-inner", "inner", "1", [{"license": {"id": "ISC"}}]),
+                ],
+            }
+        },
+    )
+    result = analyzer.analyze_manifest(bom)
+    _check("deep nesting parsed", result["status"] != "error", result.get("error"))
+    _check(
+        "pre-order across metadata and top-level components",
+        [n["id"] for n in result["nodes"]]
+        == ["root@1", "inner@1", "a@1", "b@1", "c@1"],
+        str([n["id"] for n in result["nodes"]]),
+    )
+    _check("deep nesting no unresolved", result["summary"]["unresolved"] == 0, str(result["unresolved"]))
+    _check("deep nesting edges", result["summary"]["edges"] == 4, str(result["edges"]))
+
+
+def test_metadata_root_merges_with_same_component() -> None:
+    """metadata 根组件与 components 中同名同版本同许可证的组件合并。"""
+    bom = _bom(
+        [
+            _comp("ref-app", "app", "1.0.0", [{"license": {"id": "MIT"}}]),
+            _comp("ref-lib", "lib", "1", [{"license": {"id": "MIT"}}]),
+        ],
+        [{"ref": "ref-app", "dependsOn": ["ref-lib"]}],
+        metadata={
+            "component": {
+                "type": "application",
+                "name": "app",
+                "version": "1.0.0",
+                "licenses": [{"license": {"name": "MIT License"}}],
+            }
+        },
+    )
+    result = analyzer.analyze_manifest(bom)
+    _check("metadata root merged", result["summary"]["packages"] == 2, str(result["summary"]))
+    app = next(n for n in result["nodes"] if n["id"] == "app@1.0.0")
+    _check(
+        "merged node keeps component bom-ref",
+        app["bom_refs"] == ["ref-app"],
+        str(app["bom_refs"]),
+    )
+    _check("merged root edge restored", result["summary"]["edges"] == 1, str(result["edges"]))
+
+
+def test_nested_merge_and_error_rules_kept() -> None:
+    """嵌套/根组件沿用现有合并与报错规则：不静默覆盖。"""
+    # 嵌套组件与顶层组件同名同版本同许可证 -> 合并，两个 bom-ref 都映射到同一节点
+    bom = _bom(
+        [
+            _comp("ref-top", "lib", "1.0.0", [{"license": {"id": "MIT"}}]),
+            dict(
+                _comp("ref-parent", "parent", "1", [{"license": {"id": "MIT"}}]),
+                components=[
+                    _comp("ref-nested", "lib", "1.0.0", [{"license": {"name": "MIT License"}}]),
+                ],
+            ),
+        ],
+        [{"ref": "ref-parent", "dependsOn": ["ref-top", "ref-nested"]}],
+    )
+    result = analyzer.analyze_manifest(bom)
+    _check("nested same component merged", result["summary"]["packages"] == 2, str(result["summary"]))
+    lib = next(n for n in result["nodes"] if n["id"] == "lib@1.0.0")
+    _check(
+        "both bom-refs mapped to merged node",
+        lib["bom_refs"] == ["ref-top", "ref-nested"],
+        str(lib["bom_refs"]),
+    )
+    _check("no self edge after nested merge", result["summary"]["edges"] == 1, str(result["edges"]))
+
+    # metadata 根组件与嵌套组件 bom-ref 重复 -> 422
+    dup = _bom(
+        [
+            dict(
+                _comp("ref-p", "p", "1", [{"license": {"id": "MIT"}}]),
+                components=[_comp("dup-ref", "lib", "1", [{"license": {"id": "MIT"}}])],
+            ),
+        ],
+        metadata={"component": {"bom-ref": "dup-ref", "name": "app", "version": "1"}},
+    )
+    result = analyzer.analyze_manifest(dup)
+    _check("duplicate bom-ref across metadata/nested -> error", result["status"] == "error")
+    _check("error mentions bom-ref", "dup-ref" in result["error"], result["error"])
+
+    # 嵌套组件同名同版本但许可证不一致 -> 422
+    conflict = _bom(
+        [
+            _comp("ref-a", "lib", "1.0.0", [{"license": {"id": "MIT"}}]),
+            dict(
+                _comp("ref-p", "p", "1", [{"license": {"id": "MIT"}}]),
+                components=[_comp("ref-b", "lib", "1.0.0", [{"license": {"id": "GPL-3.0"}}])],
+            ),
+        ]
+    )
+    result = analyzer.analyze_manifest(conflict)
+    _check("nested conflicting license -> error", result["status"] == "error")
+    _check(
+        "error mentions both licenses",
+        "lib@1.0.0" in result["error"] and "MIT" in result["error"] and "GPL-3.0" in result["error"],
+        result["error"],
+    )
+
+
 def test_display_name_from_metadata() -> None:
     bom = _bom(
         [_comp("r1", "lib", "1", [{"license": {"id": "MIT"}}])],
@@ -311,6 +511,10 @@ def main() -> None:
     test_conflicting_license_rejected()
     test_unresolved_refs_kept_as_warnings()
     test_wrong_bom_format_rejected()
+    test_metadata_root_and_nested_components()
+    test_deeply_nested_components()
+    test_metadata_root_merges_with_same_component()
+    test_nested_merge_and_error_rules_kept()
     test_display_name_from_metadata()
     test_history_and_export_roundtrip()
     print("\nall tests passed.")
