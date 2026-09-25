@@ -7,15 +7,22 @@
 
 导入约定：
 
-* 每个 ``components[]`` 组件规范化为一个包节点（``name@version``），组件的
-  ``bom-ref`` 记录到节点的 ``bom_refs`` 字段，并建立 ``bom-ref -> 节点`` 映射；
+* 组件登记范围为**整棵组件树**：先登记 ``metadata.component``（BOM 描述的根
+  组件，常见生成器只把根包放在这里），再按声明顺序深度优先登记顶层
+  ``components[]`` 及其任意层嵌套的 ``components``（迭代先序，顺序稳定，
+  不依赖递归深度）；每个组件规范化为一个包节点（``name@version``），
+  组件的 ``bom-ref`` 记录到节点的 ``bom_refs`` 字段；
 * 组件许可证取 ``licenses`` 中的 SPDX ``id``、``expression`` 或兜底 ``license.name``；
   纯 `` OR `` 表达式与多个并列许可证条目解析为**多许可证候选**，含 AND、括号或
   未知标识的表达式仍按未知处理，缺失许可证按未知（UNLICENSED）处理；
-* ``dependencies[]`` 按 ``ref`` / ``dependsOn`` 还原依赖边（方向：使用方 -> 被依赖方），
-  引用不到任何组件 bom-ref 的条目保留为未解析告警，不凭空造节点；
+* **先完成整棵组件树的节点登记与 ``bom-ref -> 节点`` 映射，再解析
+  ``dependencies[]``**（按 ``ref`` / ``dependsOn`` 还原依赖边，方向：
+  使用方 -> 被依赖方），因此根组件位于 metadata、依赖组件嵌在任意层
+  ``components`` 中时，引用都能解析到真实节点；引用不到任何组件 bom-ref
+  的条目保留为未解析告警，不凭空造节点；
 * 为避免静默合并，以下情况直接判定为解析错误（API 层返回 422）：
-  同一 ``bom-ref`` 重复出现；同名同版本的组件许可证不一致。
+  同一 ``bom-ref`` 在 metadata / 顶层 / 任意嵌套层重复出现；同名同版本的
+  组件许可证不一致。
 
 解析成功后完全复用 ``analyzer._build_result`` 的传递约束与最短路径冲突分析，
 审计结果与旧格式 manifest 一样进入历史列表并可按原方式导出。
@@ -23,7 +30,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from . import analyzer, licenses as lic
 
@@ -74,19 +81,19 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
     warning_seen: Set[str] = set()
     warn = lambda msg: analyzer._add_warning(warnings, warning_seen, msg)
 
-    # 1) 注册组件节点并建立 bom-ref -> 节点 映射
+    # 1) 先把整棵组件树登记为节点并建立完整的 bom-ref -> 节点 映射：
+    #    metadata.component（根包可能只在这里）先于顶层 components 登记，
+    #    嵌套 components 随父组件先序登记。映射完整后再解析 dependencies，
+    #    否则根引用与嵌套组件引用都会被误判为未解析，依赖边随之丢失。
     nodes: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
     ref_map: Dict[str, str] = {}
     seen_refs: Set[str] = set()
 
-    for component in raw_components:
-        if not isinstance(component, dict):
-            warn("components 中存在非对象条目，已跳过：%r" % (component,))
-            continue
+    for location, component in _iter_component_tree(bom, warn):
         name = str(component.get("name") or "").strip()
         if not name:
-            warn("components 中存在缺少 name 的条目，已跳过：%r" % (component,))
+            warn("%s 中存在缺少 name 的条目，已跳过：%r" % (location, component))
             continue
         version, _ = analyzer.clean_version(component.get("version"))
         nid = analyzer.node_id(name, version)
@@ -98,8 +105,8 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
             if bom_ref in seen_refs:
                 return _error_result(
                     display_name,
-                    "components 中 bom-ref 重复：%r。为避免静默合并组件，"
-                    "已中止导入，请去重后重新提交。" % bom_ref,
+                    "%s 中 bom-ref 重复：%r。为避免静默合并组件，"
+                    "已中止导入，请去重后重新提交。" % (location, bom_ref),
                 )
             seen_refs.add(bom_ref)
 
@@ -196,6 +203,72 @@ def _display_name(bom: Dict[str, Any], manifest_name: str) -> str:
             if isinstance(component, dict):
                 name = str(component.get("name") or "").strip()
     return name or str(manifest_name).strip() or "cyclonedx-bom"
+
+
+def _iter_component_tree(bom: Dict[str, Any], warn) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """按稳定顺序枚举整棵 BOM 组件树：``(位置标签, 组件)``。
+
+    遍历顺序（先序、声明序）：
+
+    1. ``metadata.component`` 先登记——很多生成器只把 BOM 根包放在元数据里，
+       顶层 ``components`` 只列依赖；根包不登记时，``dependencies`` 里它的
+       ``ref`` 会被记为未解析，整棵依赖图随之丢失；
+    2. 顶层 ``components[]`` 按数组声明顺序逐个登记；
+    3. 每个组件内嵌的 ``components`` 紧随其父组件登记（迭代深度优先，
+       不使用递归，嵌套层级再深也不受递归栈限制），同一父组件内仍按声明序。
+
+    非对象条目与畸形的嵌套 ``components`` 产生告警后跳过，不静默丢弃。
+    """
+
+    def walk(component: Dict[str, Any]) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        children = component.get("components")
+        if children is None:
+            return
+        if not isinstance(children, list):
+            warn(
+                "组件 %r 的 components 字段不是数组，其嵌套组件已忽略。"
+                % (component.get("name") or component.get("bom-ref") or "?")
+            )
+            return
+        # 栈式先序：逆序压栈，使弹出顺序与数组声明顺序一致。
+        stack: List[Tuple[str, Any]] = [
+            ("components", child) for child in reversed(children)
+        ]
+        while stack:
+            location, child = stack.pop()
+            if not isinstance(child, dict):
+                warn("components 中存在非对象条目，已跳过：%r" % (child,))
+                continue
+            yield location, child
+            nested = child.get("components")
+            if nested is None:
+                continue
+            if not isinstance(nested, list):
+                warn(
+                    "组件 %r 的 components 字段不是数组，其嵌套组件已忽略。"
+                    % (child.get("name") or child.get("bom-ref") or "?")
+                )
+                continue
+            stack.extend(
+                ("components", grandchild) for grandchild in reversed(nested)
+            )
+
+    metadata = bom.get("metadata")
+    if isinstance(metadata, dict):
+        root = metadata.get("component")
+        if root is not None:
+            if isinstance(root, dict):
+                yield "metadata.component", root
+                yield from walk(root)
+            else:
+                warn("metadata.component 不是对象，已跳过：%r" % (root,))
+
+    for component in bom.get("components") or []:
+        if not isinstance(component, dict):
+            warn("components 中存在非对象条目，已跳过：%r" % (component,))
+            continue
+        yield "components", component
+        yield from walk(component)
 
 
 def _extract_license(component: Dict[str, Any], warn) -> Optional[List[Dict[str, Any]]]:

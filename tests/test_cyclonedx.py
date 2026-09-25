@@ -253,6 +253,183 @@ def test_unresolved_refs_kept_as_warnings() -> None:
     _check("status warning due to unresolved", result["status"] == "warning", result["status"])
 
 
+def test_metadata_root_and_nested_components_registered() -> None:
+    """根包仅在 metadata.component、依赖包在嵌套 components 时，整棵树都要登记。"""
+    bom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "metadata": {
+            "component": _comp(
+                "ref-app", "app", "1.0.0", [{"license": {"id": "GPL-2.0"}}]
+            )
+            | {
+                "components": [
+                    _comp("ref-lib", "lib", "2.0.0", [{"expression": "Apache-2.0"}])
+                    | {
+                        "components": [
+                            _comp(
+                                "ref-leaf", "leaf", "3.0.0",
+                                [{"license": {"id": "MIT"}}],
+                            )
+                        ]
+                    }
+                ]
+            }
+        },
+        "dependencies": [
+            {"ref": "ref-app", "dependsOn": ["ref-lib"]},
+            {"ref": "ref-lib", "dependsOn": ["ref-leaf"]},
+        ],
+    }
+    result = analyzer.analyze_manifest(bom)
+    _check("metadata+nested no error", result["status"] == "conflict", result.get("error", ""))
+    _check("3 nodes registered from tree", result["summary"]["packages"] == 3, str(result["summary"]))
+    _check("2 edges restored via refs", result["summary"]["edges"] == 2, str(result["edges"]))
+    _check("root ref not unresolved", result["summary"]["unresolved"] == 0, str(result["unresolved"]))
+    _check(
+        "stable traversal order (pre-order)",
+        [n["id"] for n in result["nodes"]] == ["app@1.0.0", "lib@2.0.0", "leaf@3.0.0"],
+        str([n["id"] for n in result["nodes"]]),
+    )
+    by_id = {n["id"]: n for n in result["nodes"]}
+    _check(
+        "all bom-refs mapped across tree",
+        by_id["app@1.0.0"]["bom_refs"] == ["ref-app"]
+        and by_id["lib@2.0.0"]["bom_refs"] == ["ref-lib"]
+        and by_id["leaf@3.0.0"]["bom_refs"] == ["ref-leaf"],
+        str({k: v["bom_refs"] for k, v in by_id.items()}),
+    )
+    conflict = next(
+        c for c in result["conflicts"] if c["ancestor"] == "app@1.0.0" and c["node"] == "lib@2.0.0"
+    )
+    _check("conflict path real (metadata root -> nested dep)", conflict["path"] == [
+        "app@1.0.0", "lib@2.0.0"
+    ], str(conflict["path"]))
+    leaf = by_id["leaf@3.0.0"]
+    _check(
+        "transitive constraint crosses nesting levels",
+        any(c["from"] == "app@1.0.0" and c["distance"] == 2 for c in leaf["constraints"]),
+        str(leaf["constraints"]),
+    )
+
+
+def test_nested_components_under_top_level() -> None:
+    """顶层 components 中任意层嵌套的组件同样登记，跨子树引用可解析。"""
+    bom = {
+        "bomFormat": "CycloneDX",
+        "components": [
+            _comp("ref-app", "app", "1", [{"license": {"id": "MIT"}}])
+            | {"components": [
+                _comp("ref-a", "lib-a", "1", [{"license": {"id": "MIT"}}])
+                | {"components": [
+                    _comp("ref-deep", "deep", "1", [{"license": {"id": "MIT"}}])
+                ]},
+                _comp("ref-b", "lib-b", "1", [{"license": {"id": "MIT"}}]),
+            ]},
+            _comp("ref-other", "other", "1", [{"license": {"id": "MIT"}}]),
+        ],
+        "dependencies": [
+            {"ref": "ref-app", "dependsOn": ["ref-a", "ref-b", "ref-other"]},
+            {"ref": "ref-a", "dependsOn": ["ref-deep"]},
+            {"ref": "ref-b", "dependsOn": ["ref-deep"]},
+        ],
+    }
+    result = analyzer.analyze_manifest(bom)
+    _check("all nested nodes registered", result["summary"]["packages"] == 5, str(result["summary"]))
+    _check("cross-subtree edges restored", result["summary"]["edges"] == 5, str(result["edges"]))
+    _check(
+        "pre-order: parent then children in declaration order",
+        [n["id"] for n in result["nodes"]]
+        == ["app@1", "lib-a@1", "deep@1", "lib-b@1", "other@1"],
+        str([n["id"] for n in result["nodes"]]),
+    )
+
+
+def test_duplicate_bom_ref_rejected_across_tree() -> None:
+    """metadata / 顶层 / 嵌套层之间重复 bom-ref 仍按既有规则报 422，不静默覆盖。"""
+    bom = {
+        "bomFormat": "CycloneDX",
+        "metadata": {"component": _comp("dup-ref", "root", "1", [{"license": {"id": "MIT"}}])},
+        "components": [
+            _comp("ref-app", "app", "1", [{"license": {"id": "MIT"}}])
+            | {"components": [
+                _comp("dup-ref", "nested", "1", [{"license": {"id": "MIT"}}])
+            ]}
+        ],
+    }
+    result = analyzer.analyze_manifest(bom)
+    _check("duplicate bom-ref across tree -> error", result["status"] == "error")
+    _check(
+        "error mentions bom-ref",
+        "bom-ref" in result["error"] and "dup-ref" in result["error"],
+        result["error"],
+    )
+
+
+def test_conflicting_license_rejected_across_tree() -> None:
+    """同名同版本组件出现在 metadata 与嵌套层且许可证不一致时仍报 422。"""
+    bom = {
+        "bomFormat": "CycloneDX",
+        "metadata": {
+            "component": _comp(
+                "ref-root", "shared", "1.0.0", [{"license": {"id": "MIT"}}]
+            )
+        },
+        "components": [
+            _comp("ref-app", "app", "1", [{"license": {"id": "MIT"}}])
+            | {"components": [
+                _comp("ref-shared", "shared", "1.0.0", [{"license": {"id": "GPL-3.0"}}])
+            ]}
+        ],
+    }
+    result = analyzer.analyze_manifest(bom)
+    _check("cross-tree same component license clash -> error", result["status"] == "error")
+    _check(
+        "error mentions both licenses",
+        "shared@1.0.0" in result["error"] and "MIT" in result["error"] and "GPL-3.0" in result["error"],
+        result["error"],
+    )
+
+
+def test_metadata_component_without_bom_ref_and_malformed_nesting() -> None:
+    """metadata 根组件无 bom-ref 时按 name@version 参与；畸形嵌套只告警不中断。"""
+    bom = {
+        "bomFormat": "CycloneDX",
+        "metadata": {
+            "component": {
+                "type": "application",
+                "name": "root-app",
+                "version": "1",
+                "licenses": [{"license": {"id": "MIT"}}],
+                "components": "not-an-array",
+            }
+        },
+        "components": [
+            _comp("ref-lib", "lib", "1", [{"license": {"id": "MIT"}}]),
+            "junk-entry",
+        ],
+        "dependencies": [
+            {"ref": "root-app", "dependsOn": ["ref-lib"]},
+        ],
+    }
+    # 根组件无 bom-ref 时 ref/dependsOn 无法直接引用它，本 BOM 的边会未解析；
+    # 这里仅验证根组件确实登记、畸形嵌套与非对象条目产生告警而不是静默丢失。
+    result = analyzer.analyze_manifest(bom)
+    _check("status not error", result["status"] != "error", result.get("error", ""))
+    ids = {n["id"] for n in result["nodes"]}
+    _check("metadata root registered without bom-ref", "root-app@1" in ids, str(ids))
+    _check(
+        "malformed nested components warned",
+        any("components 字段不是数组" in w for w in result["warnings"]),
+        str(result["warnings"]),
+    )
+    _check(
+        "non-object component entry warned",
+        any("非对象条目" in w for w in result["warnings"]),
+        str(result["warnings"]),
+    )
+
+
 def test_wrong_bom_format_rejected() -> None:
     result = analyzer.analyze_manifest({"bomFormat": "SPDX", "components": []})
     _check("non-CycloneDX bomFormat -> error", result["status"] == "error")
@@ -310,6 +487,11 @@ def main() -> None:
     test_duplicate_bom_ref_rejected()
     test_conflicting_license_rejected()
     test_unresolved_refs_kept_as_warnings()
+    test_metadata_root_and_nested_components_registered()
+    test_nested_components_under_top_level()
+    test_duplicate_bom_ref_rejected_across_tree()
+    test_conflicting_license_rejected_across_tree()
+    test_metadata_component_without_bom_ref_and_malformed_nesting()
     test_wrong_bom_format_rejected()
     test_display_name_from_metadata()
     test_history_and_export_roundtrip()

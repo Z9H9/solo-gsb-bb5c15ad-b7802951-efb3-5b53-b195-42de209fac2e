@@ -230,34 +230,64 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "metadata": { "component": { "type": "application", "name": "shop-backend", "version": "3.2.0" } },
-  "components": [
-    {
+  "metadata": {
+    "component": {
       "type": "application",
       "bom-ref": "pkg:app/shop-backend@3.2.0",
       "name": "shop-backend",
       "version": "3.2.0",
-      "licenses": [ { "license": { "id": "GPL-2.0" } } ]
+      "licenses": [ { "license": { "id": "GPL-2.0" } } ],
+      "components": [
+        {
+          "type": "library",
+          "bom-ref": "pkg:npm/web-ui@1.4.2",
+          "name": "web-ui",
+          "version": "1.4.2",
+          "licenses": [ { "expression": "Apache-2.0" } ],
+          "components": [
+            {
+              "type": "library",
+              "bom-ref": "pkg:npm/chart-render@5.1.0",
+              "name": "chart-render",
+              "version": "5.1.0",
+              "licenses": [ { "license": { "id": "GPL-3.0" } } ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "dependencies": [
+    {
+      "ref": "pkg:app/shop-backend@3.2.0",
+      "dependsOn": ["pkg:npm/web-ui@1.4.2"]
     },
     {
-      "type": "library",
-      "bom-ref": "pkg:npm/web-ui@1.4.2",
-      "name": "web-ui",
-      "version": "1.4.2",
-      "licenses": [ { "expression": "Apache-2.0" } ]
+      "ref": "pkg:npm/web-ui@1.4.2",
+      "dependsOn": ["pkg:npm/chart-render@5.1.0"]
     }
-  ],
-  "dependencies": [
-    { "ref": "pkg:app/shop-backend@3.2.0", "dependsOn": ["pkg:npm/web-ui@1.4.2"] }
   ]
 }
 ```
 
+> **根包在 `metadata.component`、依赖在嵌套 `components`**：很多 CycloneDX
+> 生成器只把 BOM 根组件放在 `metadata.component`（顶层 `components` 仅列依赖），
+> 并把组件层次写进各组件内嵌的 `components` 里。本工具会**登记整棵组件树**：
+> 先登记 `metadata.component`，再按声明顺序先序遍历顶层及任意层嵌套
+> `components`；**所有 `bom-ref → 节点` 映射建立完整后才解析
+> `dependencies`**，因此根引用不会被误判为未解析，深层依赖边与许可证冲突
+> （含跨嵌套层的最短冲突路径）都能还原。内置示例
+> `static/examples/sample-cyclonedx.json`（`GET /api/sample/cyclonedx`）
+> 即采用这种布局，可直接点网页上的「载入 CycloneDX 示例」体验。
+
 导入约定：
 
-- **节点**：每个 `components[]` 组件按 `name` + `version` 规范化为包节点（与原生
-  manifest 同一套规则），组件的 `bom-ref` 记录在节点的 `bom_refs` 字段并建立
-  `bom-ref → 节点` 映射；审计名依次取顶层 `name`、`metadata.component.name`、
+- **节点（整棵组件树登记）**：先登记 `metadata.component` 根组件，再按声明
+  顺序深度优先（迭代先序，嵌套层级不受递归深度限制）登记顶层 `components[]`
+  及其任意层内嵌的 `components`；每个组件按 `name` + `version` 规范化为包
+  节点（与原生 manifest 同一套规则），组件的 `bom-ref` 记录在节点的
+  `bom_refs` 字段并建立 `bom-ref → 节点` 映射，**映射完整后才解析
+  `dependencies`**；审计名依次取顶层 `name`、`metadata.component.name`、
   请求参数 `name`；
 - **依赖边**：`dependencies[]` 按 `ref` / `dependsOn` 还原为「使用方 → 被依赖方」
   的依赖边，随后复用同一套兼容矩阵与最短路径冲突分析；
@@ -267,16 +297,27 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   **多许可证候选**（候选集合相同时视为同一许可证，允许合并）；含 `AND`、
   括号或未知标识的表达式保留原文按未知处理；**缺失许可证按未知处理**
   （显示为 `UNLICENSED`，相关边按“需人工确认”告警）；
-- **422（不静默合并）**：同一 `bom-ref` 重复出现，或同名同版本组件对应不同许可证
-  （单许可证按规范化标识比较，多候选按去重后的候选集合比较，`MIT` 与
-  `MIT License` 视为相同）时，返回明确的 `422` 错误并中止导入，需修正 BOM
-  后重新提交；
-- **未解析引用**：`dependencies` 中引用了不存在于 `components` 的 bom-ref 时，
-  对应条目进入 `unresolved` 列表并产生告警，不会凭空造节点；
+- **422（不静默合并）**：同一 `bom-ref` 在 metadata / 顶层 / 任意嵌套层重复
+  出现，或同名同版本组件对应不同许可证（单许可证按规范化标识比较，多候选按
+  去重后的候选集合比较，`MIT` 与 `MIT License` 视为相同）时，返回明确的
+  `422` 错误并中止导入，需修正 BOM 后重新提交；
+- **未解析引用**：`dependencies` 中引用了不存在于整棵组件树（metadata /
+  顶层 / 嵌套 `components`）的 bom-ref 时，对应条目进入 `unresolved` 列表并
+  产生告警，不会凭空造节点；
 - 结果与原生 manifest 完全一致地进入历史列表、参与两次审计对比、按包筛选与导出，
   导出 JSON 中带 `"source_format": "cyclonedx"` 标识。
 
-内置示例：`GET /api/sample/cyclonedx`（网页端「载入 CycloneDX 示例」按钮同源）。
+内置示例：`GET /api/sample/cyclonedx`（网页端「载入 CycloneDX 示例」按钮同源，
+示例 BOM 即「根包在 `metadata.component`、依赖在嵌套 `components`」的形态）。
+
+提交入口（Docker Compose 启动后均在宿主机 **8000** 端口）：
+
+- **网页上传 / 粘贴**：浏览器打开 <http://localhost:8000/>，在第 1 节粘贴 BOM
+  文本或选择 `.json` 文件上传；
+- **JSON API**：`POST http://localhost:8000/api/audit`（请求体
+  `{"manifest": <BOM>}`），或文件上传
+  `POST http://localhost:8000/api/audit/upload`（multipart 表单字段
+  `file`）；交互式文档见 <http://localhost:8000/docs>。
 
 ```bash
 # 直接提交 CycloneDX BOM 审计
